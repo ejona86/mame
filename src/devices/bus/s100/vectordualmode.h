@@ -31,6 +31,8 @@ private:
 	TIMER_CALLBACK_MEMBER(byte_cb);
 	bool hdd_selected();
 	bool get_next_bit(attotime &tm, const attotime &limit);
+	void floppy_index_cb(floppy_image_device *floppy, int state);
+	void harddisk_index_cb(mfm_harddisk_device *hdd, int state);
 
 	required_device_array<floppy_connector, 4> m_floppy;
 	required_device<mfm_harddisk_connector> m_hdd;
@@ -39,15 +41,15 @@ private:
 	uint8_t m_drive;
 	bool m_reduced_wc;
 	uint8_t m_sector;
+	uint8_t m_sector_counter;
 	bool m_read;
 	bool m_ecc;
 	bool m_wpcom;
+	bool m_busy;
 	emu_timer *m_motor_on_timer;
+	attotime m_last_sector_pulse; // fdd
+	attotime m_last_index_pulse; // hdd
 
-	enum sector_timer_state {
-		SECTOR_START,
-		SECTOR_END,
-	};
 	fdc_pll_t m_pll;
 	emu_timer *m_byte_timer;
 	emu_timer *m_sector_timer;

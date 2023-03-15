@@ -68,9 +68,13 @@ s100_vector_dualmode_device::s100_vector_dualmode_device(const machine_config &m
 	, m_drive(0)
 	, m_reduced_wc(false)
 	, m_sector(0)
+	, m_sector_counter(0)
 	, m_read(false)
 	, m_ecc(false)
 	, m_wpcom(false)
+	, m_busy(false)
+	, m_last_sector_pulse(attotime::zero)
+	, m_last_index_pulse(attotime::zero)
 	, m_pll()
 	, m_byte_timer(nullptr)
 	, m_sector_timer(nullptr)
@@ -86,6 +90,8 @@ TIMER_CALLBACK_MEMBER(s100_vector_dualmode_device::motor_off)
 		if (flop)
 			flop->mon_w(1);
 	}
+	m_byte_timer->enable(false);
+	m_busy = false;
 }
 
 bool s100_vector_dualmode_device::hdd_selected()
@@ -95,7 +101,7 @@ bool s100_vector_dualmode_device::hdd_selected()
 
 uint8_t s100_vector_dualmode_device::s100_sinp_r(offs_t offset)
 {
-	if (m_sector_timer->enabled())
+	if (m_busy)
 		return 0xff;
 	// 7200-1200-02-1 page 16 (1-10)
 	uint8_t data;
@@ -131,7 +137,7 @@ uint8_t s100_vector_dualmode_device::s100_sinp_r(offs_t offset)
 		    | 0xc0;
 	} else if (offset == 0xc1) { // status (1) port
 		bool floppy_disk_selected;
-		bool controller_busy = m_sector_timer->enabled(); // returned early if true
+		bool controller_busy = m_busy; // returned early if true
 		bool motor_on; // FDD
 		bool type_of_hard_disk = true;
 		if (hdd_selected()) {
@@ -164,7 +170,7 @@ uint8_t s100_vector_dualmode_device::s100_sinp_r(offs_t offset)
 
 void s100_vector_dualmode_device::s100_sout_w(offs_t offset, uint8_t data)
 {
-	if (m_sector_timer->enabled())
+	if (m_busy)
 		return;
 	// 7200-1200-02-1 page 14 (1-8)
 	if (offset == 0xc0) { // control (0) port
@@ -187,6 +193,7 @@ void s100_vector_dualmode_device::s100_sout_w(offs_t offset, uint8_t data)
 			hdd->headsel_w(head & (hdd->get_actual_heads()-1));
 			hdd->step_w(step ? ASSERT_LINE : CLEAR_LINE);
 			hdd->direction_in_w(step_in ? ASSERT_LINE : CLEAR_LINE);
+			hdd->setup_index_pulse_cb(mfm_harddisk_device::index_pulse_cb(&s100_vector_dualmode_device::harddisk_index_cb, this));
 		} else {
 			floppy_image_device *flop = m_floppy[m_drive]->get_device();
 			if (flop) {
@@ -194,7 +201,10 @@ void s100_vector_dualmode_device::s100_sout_w(offs_t offset, uint8_t data)
 				// Software should not change other bits when pulsing step
 				flop->stp_w(!step);
 				flop->dir_w(!step_in);
+				flop->setup_index_pulse_cb(floppy_image_device::index_pulse_cb(&s100_vector_dualmode_device::floppy_index_cb, this));
 			}
+			if (m_sector_timer->enabled())
+				m_sector_timer->reset();
 		}
 	} else if (offset == 0xc1) { // control (1) port
 		m_sector = BIT(data, 0, 5);
@@ -205,24 +215,7 @@ void s100_vector_dualmode_device::s100_sout_w(offs_t offset, uint8_t data)
 		m_ram[m_cmar++] = data;
 		m_cmar &= 0x1ff;
 	} else if (offset == 0xc3) { // start port
-		attotime rot_time, next_index;
-		int sectors;
-		if (hdd_selected()) {
-			rot_time = attotime::from_hz(60);
-			next_index = m_hdd->get_device()->track_end_time();
-			sectors = 32;
-		} else {
-			floppy_image_device *flop = m_floppy[m_drive]->get_device();
-			if (!flop || flop->time_next_index().is_never())
-				return;
-			rot_time = attotime::from_msec(200);
-			next_index = flop->time_next_index();
-			sectors = 16;
-		}
-		attotime sector_time = next_index - machine().time() + (rot_time / sectors) * m_sector;
-		if (sector_time > rot_time)
-			sector_time -= rot_time;
-		m_sector_timer->adjust(sector_time, SECTOR_START);
+		m_busy = m_motor_on_timer->enabled();
 	}
 }
 
@@ -237,10 +230,56 @@ bool s100_vector_dualmode_device::get_next_bit(attotime &tm, const attotime &lim
 	return true;
 }
 
+void s100_vector_dualmode_device::floppy_index_cb(floppy_image_device *floppy, int state)
+{
+	if (hdd_selected() || m_floppy[m_drive]->get_device() != floppy)
+		return;
+	if (!state)
+		return;
+	attotime now = machine().time();
+	// U25 74LS221: 61.9 KOhm * .22 uF * .75
+	if (now - m_last_sector_pulse < attotime::from_nsec(10213500)) {
+		m_sector_counter = 0xf;
+	} else {
+		m_last_sector_pulse = now;
+		sector_cb(0);
+	}
+}
+
+void s100_vector_dualmode_device::harddisk_index_cb(mfm_harddisk_device *hdd, int state)
+{
+	if (!hdd_selected())
+		return;
+	if (!state)
+		return;
+	// U20 4046 PLL for 32x multiplier
+	attotime now = machine().time();
+	m_sector_counter = 0x1f;
+	attotime sector_time = (now - m_last_index_pulse)/32;
+	m_last_index_pulse = now;
+	m_sector_timer->adjust(sector_time, 0, sector_time);
+	sector_cb(0);
+}
+
 TIMER_CALLBACK_MEMBER(s100_vector_dualmode_device::sector_cb)
 {
-	switch (param) {
-	case SECTOR_START:
+	m_sector_counter++;
+	m_sector_counter &= hdd_selected() ? 0x1f : 0xf;
+	if (hdd_selected() && m_sector_counter == 0x1f)
+		m_sector_timer->reset(); // wait for IDX
+	if (!m_busy)
+		return;
+
+	if (m_byte_timer->enabled()) {
+		// op completed
+		m_byte_timer->enable(false);
+		m_busy = false;
+		if (m_read && !hdd_selected())
+			m_ram[274] = 0; // Ignore ECC
+		return;
+	}
+
+	if (m_sector_counter == m_sector) {
 		if (m_read) {
 			if (hdd_selected()) {
 				attotime tm = machine().time() + hdd_half_bitcell_size*256;
@@ -269,17 +308,6 @@ TIMER_CALLBACK_MEMBER(s100_vector_dualmode_device::sector_cb)
 			m_pending_size = 0;
 			m_byte_timer->adjust(attotime::zero);
 		}
-		if (hdd_selected())
-			m_sector_timer->adjust(attotime::from_hz(60)/32, SECTOR_END);
-		else
-			m_sector_timer->adjust(attotime::from_msec(200)/16, SECTOR_END);
-		break;
-
-	case SECTOR_END:
-		m_byte_timer->enable(false);
-		if (m_read && !hdd_selected())
-			m_ram[274] = 0; // Ignore ECC
-		break;
 	}
 }
 
@@ -333,14 +361,27 @@ void s100_vector_dualmode_device::device_start()
 	m_byte_timer = timer_alloc(FUNC(s100_vector_dualmode_device::byte_cb), this);
 	m_sector_timer = timer_alloc(FUNC(s100_vector_dualmode_device::sector_cb), this);
 
+	if (m_floppy[0]->get_device())
+		m_floppy[0]->get_device()->setup_index_pulse_cb(floppy_image_device::index_pulse_cb(&s100_vector_dualmode_device::floppy_index_cb, this));
+	if (m_floppy[1]->get_device())
+		m_floppy[1]->get_device()->setup_index_pulse_cb(floppy_image_device::index_pulse_cb(&s100_vector_dualmode_device::floppy_index_cb, this));
+	if (m_floppy[2]->get_device())
+		m_floppy[2]->get_device()->setup_index_pulse_cb(floppy_image_device::index_pulse_cb(&s100_vector_dualmode_device::floppy_index_cb, this));
+	if (m_floppy[3]->get_device())
+		m_floppy[3]->get_device()->setup_index_pulse_cb(floppy_image_device::index_pulse_cb(&s100_vector_dualmode_device::floppy_index_cb, this));
+	if (m_hdd->get_device())
+		m_hdd->get_device()->setup_index_pulse_cb(mfm_harddisk_device::index_pulse_cb(&s100_vector_dualmode_device::harddisk_index_cb, this));
+
 	save_item(NAME(m_ram));
 	save_item(NAME(m_cmar));
 	save_item(NAME(m_drive));
 	save_item(NAME(m_reduced_wc));
 	save_item(NAME(m_sector));
+	save_item(NAME(m_sector_counter));
 	save_item(NAME(m_read));
 	save_item(NAME(m_ecc));
 	save_item(NAME(m_wpcom));
+	save_item(NAME(m_busy));
 	save_item(NAME(m_pending_byte));
 	save_item(NAME(m_pending_size));
 }
